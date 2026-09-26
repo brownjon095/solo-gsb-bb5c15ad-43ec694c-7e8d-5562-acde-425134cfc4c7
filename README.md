@@ -6,6 +6,10 @@ A、B 两组 RFC 6902 补丁（仅支持 `add` / `remove` / `replace`），服�
 产出**确定的合并结果**；当两组补丁在同一元素/对象路径上发生「删除 vs 修改」或「不同值替换」等
 冲突时，返回**结构化冲突**（含双方操作序号、规范化路径、原因）。
 
+此外提供**变基（rebase）预演**：给定原始 `base`、基于 `base` 的待发布 `patch` 和上游新版本
+`onto`，服务把 `base`→`onto` 的变化转换为基准坐标操作并与 `patch` 合并，返回合并结果与一份
+**相对 `onto` 的可执行补丁**（服务端重放校验），冲突时只返回结构化冲突、不返回可执行补丁。
+
 技术栈：Node.js 20+ · Fastify 5 · 纯内存存储（无外部依赖服务）。
 
 ---
@@ -34,6 +38,7 @@ npm ci && npm start
 | 端口 | `3000` |
 | 健康检查 | `http://localhost:3000/health` |
 | 合并接口 | `POST http://localhost:3000/api/v1/merges` |
+| 变基接口 | `POST http://localhost:3000/api/v1/rebases` |
 
 ## 配置项（环境变量）
 
@@ -58,6 +63,7 @@ npm ci && npm start
 | `POST` | `/api/v1/merges/:id/resolution-preview` | 对冲突记录按冲突序号提交胜方决定（A/B），预览解决结果（不修改记录） |
 | `GET` | `/api/v1/merges/:id/round-trip-plan` | 为干净合并记录生成确定性 RFC 6902 forward（base→merged）/ rollback（merged→base）补丁，服务端重放校验后返回 |
 | `GET` | `/api/v1/merges/:id/provenance` | 干净合并记录的叶子级来源追踪：`merged` 每个叶子路径标注 `base` / `A` / `B` / `both` 及贡献操作的原始序号 |
+| `POST` | `/api/v1/rebases` | 变基预演：把基于 `base` 的 `patch` 迁移到新版本 `onto`，返回 `merged` 与相对 `onto` 的 `rebasedPatch`（服务端重放校验），冲突时不返回可执行补丁 |
 | `DELETE` | `/api/v1/merges/:id` | 删除单条预演（`204`） |
 
 ### `POST /api/v1/merges`
@@ -386,6 +392,105 @@ curl -s http://localhost:3000/api/v1/merges/<id>/round-trip-plan | jq
 curl -s http://localhost:3000/api/v1/merges/<id>/provenance | jq
 ```
 
+### `POST /api/v1/rebases`（变基预演）
+
+把一份**基于旧版本 `base` 的待发布补丁**迁移到上游新版本 `onto` 上。服务先把 `base` → `onto`
+的变化转换为合并引擎的**基准坐标操作**（记为 `upstream`）：对象按键寻址；数组按深度相等元素的
+**最长公共子序列（LCS）**对齐——相等元素保留身份原地不动，未匹配的基准元素按**基准下标**删除、
+未匹配的目标元素按**基准缝隙**插入，连续插入归入同一缝隙并按序累积。随后 `upstream`（作为 A 方）
+与客户端 `patch`（作为 B 方）在基准坐标下合并（与 `POST /api/v1/merges` 同一引擎、同一冲突模型）。
+
+请求体（也见 `examples/rebase-request.json`，或 `GET /api/v1/example`）：
+
+```json
+{
+  "base":  { "任意": "JSON 文档" },
+  "patch": [ { "op": "replace", "path": "/replicas", "value": 3 } ],
+  "onto":  { "上游": "新版本文档" }
+}
+```
+
+- `base`：补丁最初针对的原始文档；`patch`：基于 `base` 的 RFC 6902 操作数组
+  （仅 `add` / `remove` / `replace`）；`onto`：上游新版本文档。
+
+响应：
+
+- **变基干净 → `200`**：
+
+  ```jsonc
+  {
+    "status": "clean",
+    "merged": { /* base + 上游变化 + 客户端补丁的合并结果 */ },
+    "rebasedPatch": [ /* 相对 onto 的 RFC 6902 补丁：作用于 onto 恰好得到 merged */ ],
+    "upstream": [ /* base→onto 的基准坐标操作（合并引擎的 A 方输入） */ ],
+    "conflicts": []
+  }
+  ```
+
+  `rebasedPatch` 只含 `add` / `remove` / `replace`，按严格 RFC 6902 顺序执行；服务端在返回前
+  **实际重放**该补丁，确认 `apply(onto, rebasedPatch)` 与 `merged` 深度相等（校验失败按 `500`
+  处理，正常输入下不会发生）。
+
+- **存在冲突 → `409`**：
+
+  ```jsonc
+  {
+    "status": "conflict",
+    "merged": null,
+    "rebasedPatch": null,          // 冲突时不返回可执行补丁
+    "upstream": [ /* 同上 */ ],
+    "conflicts": [
+      {
+        "reason": "replace-mismatch",
+        "path": "/mode",
+        "operations": [
+          { "side": "A", "index": 0, "op": "replace", "path": "/mode", "value": "readonly" },
+          { "side": "B", "index": 0, "op": "replace", "path": "/mode", "value": "single" }
+        ],
+        "message": "both patches replace the same target with different values (A#0 vs B#0)"
+      }
+    ]
+  }
+  ```
+
+  冲突结构与 `POST /api/v1/merges` 完全一致（`reason` / `path` / 双方操作 / `message`）。
+  `operations` 中 **`side: "A"` 指上游操作**，`index` 为响应 `upstream` 数组的下标；
+  **`side: "B"` 指客户端 `patch`**，`index` 为请求体补丁中的操作序号（0 起）。
+
+- **补丁不合法（路径不存在、越界、缺 `value` 等）→ `422`**：同 `POST /api/v1/merges`，
+  `{ statusCode, error, code: "INVALID_PATCH", message, details: { side, index } }`
+  （客户端 `patch` 的问题记 `side: "B"`）。
+- **请求体结构/操作类型不合法 → `400`**。
+
+说明：
+
+- 变基是**无状态**的：结果不落内存存储，同一请求重复提交返回**逐字节一致**的响应。
+- 上游与客户端在**同一数组缝隙**都插入时，上游元素排在客户端之前（A 后 B 定序的自然延伸）。
+- 客户端补丁里的数组下标按**基准坐标**解释：上游删除使元素前移时，补丁对幸存元素的修改
+  仍跟随其基准身份落位（见下例）。
+
+完整流程示例：
+
+```bash
+# 干净变基：上游删除 servers[0]、追加一台机器、开启 tracing、新增 region；
+# 客户端补丁把 replicas 改为 3 并新增 features.retries —— 两边互不相交
+curl -s -X POST http://localhost:3000/api/v1/rebases \
+  -H 'Content-Type: application/json' \
+  -d @examples/rebase-request.json | jq
+# => 200；rebasedPatch 为
+#    [ { "op": "add", "path": "/features/retries", "value": 3 },
+#      { "op": "replace", "path": "/replicas", "value": 3 } ]
+#    把它按 RFC 6902 作用于 onto 即得 merged
+
+# 冲突变基：上游把 /mode 改为 readonly 并删除 servers[0]；
+# 客户端补丁替换 /mode 并修改 servers[0] 内部
+curl -s -X POST http://localhost:3000/api/v1/rebases \
+  -H 'Content-Type: application/json' \
+  -d @examples/rebase-conflict-request.json | jq
+# => 409；conflicts 给出 replace-mismatch（/mode，A#0 vs B#0）与
+#    delete-vs-modify（/servers/0，A#1 vs B#1），rebasedPatch 为 null
+```
+
 ## 示例请求
 
 干净合并（也见 `examples/merge-request.json`，或 `GET /api/v1/example`）：
@@ -471,6 +576,9 @@ curl -s -X POST http://localhost:3000/api/v1/merges/<id>/resolution-preview \
   -d @examples/resolution-preview-request.json | jq       # 冲突解决预览
 curl -s http://localhost:3000/api/v1/merges/<id>/round-trip-plan | jq  # forward / rollback 补丁
 curl -s http://localhost:3000/api/v1/merges/<id>/provenance | jq       # 叶子来源追踪（base/A/B/both）
+curl -s -X POST http://localhost:3000/api/v1/rebases \
+  -H 'Content-Type: application/json' \
+  -d @examples/rebase-request.json | jq                                # 变基预演（merged + rebasedPatch）
 curl -s -X DELETE http://localhost:3000/api/v1/merges/<id> # 删除记录
 ```
 
@@ -535,7 +643,10 @@ npm test
 前向与回滚重放校验、操作数统计、干净记录可用 / 冲突记录 `409` 且不改记录 / 未知 `404`
 与重复请求逐字节一致，以及叶子来源追踪的 base / A / B / both 归属（相同值双边写入）、
 后写覆盖与删除后重建的幸存操作归属、数组删除重定位与同缝隙 A/B 定序下的最终指针、
-空容器叶子、根替换、路径排序与重复请求逐字节一致等。
+空容器叶子、根替换、路径排序与重复请求逐字节一致，以及变基预演的基准坐标上游转换
+（数组 LCS 对齐、未匹配元素删除/插入、连续插入归入同一缝隙）、干净变基的 merged 与
+rebasedPatch 重放校验、同缝隙上游优先定序、冲突 `409`（路径/原因/双方序号、无可执行补丁）、
+`400`/`422` 输入校验、空补丁与根替换边界、无状态与重复请求逐字节一致等。
 
 ## 项目结构
 
@@ -549,6 +660,7 @@ npm test
 │   ├── resolution.js          # 冲突解决预览：胜方决定校验 → 剔除败方 → 复用合并引擎（纯函数，不写存储）
 │   ├── roundtrip.js           # 往返补丁：字典序对象 diff + 数组 LCS（删除降序/插入升序）→ RFC 6902 forward/rollback，服务端重放校验
 │   ├── provenance.js          # 叶子来源追踪：在带来源标签的镜像文档上重放基准坐标合并，归属 merged 每个叶子（base/A/B/both）
+│   ├── rebase.js              # 变基：base→onto 转基准坐标操作（数组 LCS 对齐、缝隙插入）→ 与客户端补丁合并 → 生成并重放校验 onto 相对补丁
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
 ├── test/                      # node:test 单元 + 集成测试
@@ -571,3 +683,7 @@ npm test
   基准坐标合并管线，把 `merged` 每个叶子归属到 `base` / `A` / `B` / `both` 并列出贡献
   操作的原始序号；路径为最终 JSON Pointer，按 UTF-16 码元序排序，结果按记录缓存，
   重复请求逐字节一致；仅干净合并记录可用，冲突记录返回 `409`。
+- 变基（`POST /api/v1/rebases`）是无状态预演：不写内存存储、不返回记录 `id`；`upstream`
+  为 `base`→`onto` 的基准坐标操作（数组合并按缝隙寻址，不能直接当顺序补丁执行），
+  `rebasedPatch` 才是相对 `onto` 的可执行 RFC 6902 补丁（服务端已重放校验等于 `merged`）；
+  冲突时 `rebasedPatch` 为 `null`，只返回结构化冲突。

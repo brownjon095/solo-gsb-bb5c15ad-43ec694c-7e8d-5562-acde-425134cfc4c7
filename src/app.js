@@ -5,8 +5,14 @@ import { auditOrdering } from './audit.js';
 import { previewResolution, DecisionError, DECISION_CODES } from './resolution.js';
 import { buildRoundTripPlan } from './roundtrip.js';
 import { computeProvenance } from './provenance.js';
+import { rebasePatch } from './rebase.js';
 import { MergeStore } from './store.js';
-import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
+import {
+  EXAMPLE_REQUEST,
+  EXAMPLE_CONFLICT_REQUEST,
+  EXAMPLE_REBASE_REQUEST,
+  EXAMPLE_REBASE_CONFLICT_REQUEST,
+} from './example.js';
 
 export const VERSION = '1.0.0';
 
@@ -29,6 +35,17 @@ const mergeBodySchema = {
     base: true,
     patchA: { type: 'array', items: operationSchema },
     patchB: { type: 'array', items: operationSchema },
+  },
+};
+
+const rebaseBodySchema = {
+  type: 'object',
+  required: ['base', 'patch', 'onto'],
+  additionalProperties: false,
+  properties: {
+    base: true,
+    patch: { type: 'array', items: operationSchema },
+    onto: true,
   },
 };
 
@@ -118,6 +135,8 @@ export function buildApp(options = {}) {
         'deterministic RFC 6902 forward (base -> merged) and rollback (merged -> base) patches, replayed server-side',
       'GET /api/v1/merges/:id/provenance':
         'per-leaf source attribution (base / A / B / both) of a clean merge at final JSON Pointers, with contributing operation indices',
+      'POST /api/v1/rebases':
+        'rebase { base, patch, onto }: merge the client patch with the base->onto delta and return merged plus an onto-relative rebasedPatch (replayed server-side), or structured conflicts',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
     },
   }));
@@ -126,6 +145,9 @@ export function buildApp(options = {}) {
     description: 'POST the body below to /api/v1/merges',
     mergeRequest: EXAMPLE_REQUEST,
     conflictRequest: EXAMPLE_CONFLICT_REQUEST,
+    rebaseDescription: 'POST the bodies below to /api/v1/rebases',
+    rebaseRequest: EXAMPLE_REBASE_REQUEST,
+    rebaseConflictRequest: EXAMPLE_REBASE_CONFLICT_REQUEST,
   }));
 
   app.post('/api/v1/merges', { schema: { body: mergeBodySchema } }, async (req, reply) => {
@@ -327,6 +349,28 @@ export function buildApp(options = {}) {
       });
     }
     return reply.code(204).send();
+  });
+
+  app.post('/api/v1/rebases', { schema: { body: rebaseBodySchema } }, async (req, reply) => {
+    const { base, patch, onto } = req.body;
+    let result;
+    try {
+      result = rebasePatch(base, patch, onto);
+    } catch (err) {
+      if (err instanceof PatchError) {
+        return reply.code(422).send({
+          statusCode: 422,
+          error: 'Unprocessable Entity',
+          code: err.code,
+          message: err.message,
+          details: err.details,
+        });
+      }
+      throw err;
+    }
+    // Stateless: nothing is stored. Conflict answers carry no executable
+    // patch (rebasedPatch is null), only the structured conflicts.
+    return reply.code(result.status === 'clean' ? 200 : 409).send(result);
   });
 
   return app;

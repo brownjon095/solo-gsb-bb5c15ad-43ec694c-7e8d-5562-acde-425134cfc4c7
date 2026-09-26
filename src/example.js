@@ -41,3 +41,57 @@ export const EXAMPLE_CONFLICT_REQUEST = {
     { op: 'replace', path: '/mode', value: 'readonly' },
   ],
 };
+
+/**
+ * Canned rebase payload, also mirrored in examples/rebase-request.json.
+ * The client patch (replicas -> 3, features.retries) is rebased onto a new
+ * upstream version that removed servers[0], appended a server, flipped
+ * tracing and added a region — disjoint from the client changes, so the
+ * rebase is clean.
+ */
+export const EXAMPLE_REBASE_REQUEST = {
+  base: {
+    app: 'payment-service',
+    replicas: 2,
+    servers: [
+      { host: 'a.internal', port: 8080 },
+      { host: 'b.internal', port: 8080 },
+    ],
+    features: { cache: true, tracing: false },
+  },
+  patch: [
+    { op: 'replace', path: '/replicas', value: 3 },
+    { op: 'add', path: '/features/retries', value: 3 },
+  ],
+  onto: {
+    app: 'payment-service',
+    replicas: 2,
+    servers: [
+      { host: 'b.internal', port: 8080 },
+      { host: 'c.internal', port: 9090 },
+    ],
+    features: { cache: true, tracing: true },
+    region: 'eu-west',
+  },
+};
+
+/**
+ * Canned conflicting rebase payload, mirrored in
+ * examples/rebase-conflict-request.json: upstream flipped /mode and removed
+ * servers[0], while the client patch replaces /mode and edits inside
+ * servers[0].
+ */
+export const EXAMPLE_REBASE_CONFLICT_REQUEST = {
+  base: {
+    mode: 'ha',
+    servers: [{ host: 'a.internal' }, { host: 'b.internal' }],
+  },
+  patch: [
+    { op: 'replace', path: '/mode', value: 'single' },
+    { op: 'replace', path: '/servers/0/host', value: 'a2.internal' },
+  ],
+  onto: {
+    mode: 'readonly',
+    servers: [{ host: 'b.internal' }],
+  },
+};
