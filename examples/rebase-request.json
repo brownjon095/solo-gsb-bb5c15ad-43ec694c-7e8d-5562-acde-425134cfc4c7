@@ -1,0 +1,27 @@
+{
+  "base": {
+    "app": "payment-service",
+    "replicas": 2,
+    "servers": [
+      { "host": "a.internal", "port": 8080 },
+      { "host": "b.internal", "port": 8080 }
+    ],
+    "features": { "cache": true, "tracing": false }
+  },
+  "patch": [
+    { "op": "replace", "path": "/replicas", "value": 3 },
+    { "op": "add", "path": "/servers/1", "value": { "host": "canary.internal", "port": 8080 } },
+    { "op": "replace", "path": "/features/tracing", "value": true }
+  ],
+  "onto": {
+    "app": "payment-service",
+    "replicas": 2,
+    "servers": [
+      { "host": "a.internal", "port": 8080 },
+      { "host": "b.internal", "port": 8080 },
+      { "host": "c.internal", "port": 8080 }
+    ],
+    "features": { "cache": true, "tracing": false, "retries": 3 },
+    "version": "2.0.0"
+  }
+}

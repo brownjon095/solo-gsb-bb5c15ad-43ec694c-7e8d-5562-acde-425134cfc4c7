@@ -41,3 +41,37 @@ export const EXAMPLE_CONFLICT_REQUEST = {
     { op: 'replace', path: '/mode', value: 'readonly' },
   ],
 };
+
+/**
+ * Canned rebase payload, also mirrored in examples/rebase-request.json.
+ * The platform moved base -> onto (appended a server, added retries and a
+ * version marker) while the client's patch still targets base; the rebase
+ * relocates the client changes onto the new version.
+ */
+export const EXAMPLE_REBASE_REQUEST = {
+  base: {
+    app: 'payment-service',
+    replicas: 2,
+    servers: [
+      { host: 'a.internal', port: 8080 },
+      { host: 'b.internal', port: 8080 },
+    ],
+    features: { cache: true, tracing: false },
+  },
+  patch: [
+    { op: 'replace', path: '/replicas', value: 3 },
+    { op: 'add', path: '/servers/1', value: { host: 'canary.internal', port: 8080 } },
+    { op: 'replace', path: '/features/tracing', value: true },
+  ],
+  onto: {
+    app: 'payment-service',
+    replicas: 2,
+    servers: [
+      { host: 'a.internal', port: 8080 },
+      { host: 'b.internal', port: 8080 },
+      { host: 'c.internal', port: 8080 },
+    ],
+    features: { cache: true, tracing: false, retries: 3 },
+    version: '2.0.0',
+  },
+};

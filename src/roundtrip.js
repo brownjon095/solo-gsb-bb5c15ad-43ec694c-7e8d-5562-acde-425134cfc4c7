@@ -89,28 +89,28 @@ function diffObject(base, merged, segments, out) {
 }
 
 /**
- * Longest common subsequence of deeply equal elements.
- * Returns the base indices that belong to the LCS (ascending). On equal DP
- * scores the base side is skipped first, which makes the alignment unique even
- * when an element value repeats.
+ * Longest common subsequence of deeply equal elements, returned as
+ * [baseIndex, targetIndex] pairs ascending in both coordinates. On equal DP
+ * scores the base side is skipped first, which makes the alignment unique
+ * even when an element value repeats.
  */
-function lcsBaseKept(base, merged) {
+export function lcsPairs(base, target) {
   const n = base.length;
-  const m = merged.length;
+  const m = target.length;
   const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
-      dp[i][j] = deepEqual(base[i], merged[j])
+      dp[i][j] = deepEqual(base[i], target[j])
         ? dp[i + 1][j + 1] + 1
         : Math.max(dp[i + 1][j], dp[i][j + 1]);
     }
   }
-  const kept = new Set();
+  const pairs = [];
   let i = 0;
   let j = 0;
   while (i < n && j < m) {
-    if (deepEqual(base[i], merged[j]) && dp[i][j] === dp[i + 1][j + 1] + 1) {
-      kept.add(i);
+    if (deepEqual(base[i], target[j]) && dp[i][j] === dp[i + 1][j + 1] + 1) {
+      pairs.push([i, j]);
       i++;
       j++;
     } else if (dp[i + 1][j] >= dp[i][j + 1]) {
@@ -119,7 +119,12 @@ function lcsBaseKept(base, merged) {
       j++;
     }
   }
-  return kept;
+  return pairs;
+}
+
+/** Base indices kept by the LCS alignment (ascending set). */
+function lcsBaseKept(base, merged) {
+  return new Set(lcsPairs(base, merged).map(([i]) => i));
 }
 
 function diffArray(base, merged, segments, out) {

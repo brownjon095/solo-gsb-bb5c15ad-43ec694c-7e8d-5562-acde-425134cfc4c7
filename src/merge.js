@@ -31,6 +31,9 @@ export class PatchError extends Error {
   }
 }
 
+/** Default side labels for the two merged patches. */
+const DEFAULT_SIDES = Object.freeze(['A', 'B']);
+
 /* ------------------------------ JSON Pointer ----------------------------- */
 
 export function parsePointer(pointer) {
@@ -443,23 +446,29 @@ export function applyMerge(base, ops) {
  * the dropped-op bookkeeping and the surviving operations in application
  * order ([A..., B...]). `duplicates` maps a dropped op id to the surviving
  * op it duplicates (equal-value writes only).
+ *
+ * `sides` relabels the two patches (operation ids, conflict references,
+ * error messages); the first label belongs to patchA, the second to patchB.
+ * Equal-value writes are still deduplicated in favour of the FIRST patch.
  */
-export function planMerge(base, patchA, patchB) {
-  const opsA = resolveIntraPatch(normalizePatch(base, patchA, 'A'), 'A');
-  const opsB = resolveIntraPatch(normalizePatch(base, patchB, 'B'), 'B');
+export function planMerge(base, patchA, patchB, { sides = DEFAULT_SIDES } = {}) {
+  const opsA = resolveIntraPatch(normalizePatch(base, patchA, sides[0]), sides[0]);
+  const opsB = resolveIntraPatch(normalizePatch(base, patchB, sides[1]), sides[1]);
   const { conflicts, dropped, duplicates } = detectCrossConflicts(opsA, opsB);
   const surviving = [...opsA, ...opsB].filter((o) => !dropped.has(o.id));
   return { opsA, opsB, conflicts, dropped, duplicates, surviving };
 }
 
-export function mergePatches(base, patchA, patchB) {
-  const { opsA, opsB, conflicts, dropped, surviving } = planMerge(base, patchA, patchB);
+export function mergePatches(base, patchA, patchB, { sides = DEFAULT_SIDES } = {}) {
+  const { opsA, opsB, conflicts, dropped, surviving } = planMerge(base, patchA, patchB, {
+    sides,
+  });
   conflicts.sort(
     (x, y) => x.path.localeCompare(y.path) || x.reason.localeCompare(y.reason),
   );
   const stats = {
-    received: { A: patchA.length, B: patchB.length },
-    normalized: { A: opsA.length, B: opsB.length },
+    received: { [sides[0]]: patchA.length, [sides[1]]: patchB.length },
+    normalized: { [sides[0]]: opsA.length, [sides[1]]: opsB.length },
     deduplicated: dropped.size,
     conflicts: conflicts.length,
     applied: 0,

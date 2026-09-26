@@ -5,8 +5,9 @@ import { auditOrdering } from './audit.js';
 import { previewResolution, DecisionError, DECISION_CODES } from './resolution.js';
 import { buildRoundTripPlan } from './roundtrip.js';
 import { computeProvenance } from './provenance.js';
+import { rebasePatch } from './rebase.js';
 import { MergeStore } from './store.js';
-import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
+import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST, EXAMPLE_REBASE_REQUEST } from './example.js';
 
 export const VERSION = '1.0.0';
 
@@ -29,6 +30,17 @@ const mergeBodySchema = {
     base: true,
     patchA: { type: 'array', items: operationSchema },
     patchB: { type: 'array', items: operationSchema },
+  },
+};
+
+const rebaseBodySchema = {
+  type: 'object',
+  required: ['base', 'patch', 'onto'],
+  additionalProperties: false,
+  properties: {
+    base: true,
+    patch: { type: 'array', items: operationSchema },
+    onto: true,
   },
 };
 
@@ -108,6 +120,9 @@ export function buildApp(options = {}) {
       'GET /health': 'liveness/readiness probe',
       'GET /api/v1/example': 'example merge request payload',
       'POST /api/v1/merges': 'rehearse a merge of { base, patchA, patchB }',
+      'POST /api/v1/rebases':
+        'rebase { base, patch, onto }: move a pending patch onto a new document version ' +
+        '(clean: merged + replayed rebasedPatch relative to onto; conflict: structured clashes, no executable patch)',
       'GET /api/v1/merges': 'list stored rehearsals',
       'GET /api/v1/merges/:id': 'fetch one rehearsal (inputs + outcome)',
       'GET /api/v1/merges/:id/order-audit':
@@ -123,9 +138,10 @@ export function buildApp(options = {}) {
   }));
 
   app.get('/api/v1/example', async () => ({
-    description: 'POST the body below to /api/v1/merges',
+    description: 'POST the bodies below to /api/v1/merges and /api/v1/rebases',
     mergeRequest: EXAMPLE_REQUEST,
     conflictRequest: EXAMPLE_CONFLICT_REQUEST,
+    rebaseRequest: EXAMPLE_REBASE_REQUEST,
   }));
 
   app.post('/api/v1/merges', { schema: { body: mergeBodySchema } }, async (req, reply) => {
@@ -147,6 +163,28 @@ export function buildApp(options = {}) {
     }
     const record = store.save({ base, patchA, patchB, ...result });
     return reply.code(result.status === 'clean' ? 200 : 409).send(publicRecord(record));
+  });
+
+  // Stateless rehearsal: rebase results are derived from the request alone,
+  // so nothing is stored and no id is issued.
+  app.post('/api/v1/rebases', { schema: { body: rebaseBodySchema } }, async (req, reply) => {
+    const { base, patch, onto } = req.body;
+    let result;
+    try {
+      result = rebasePatch(base, patch, onto);
+    } catch (err) {
+      if (err instanceof PatchError) {
+        return reply.code(422).send({
+          statusCode: 422,
+          error: 'Unprocessable Entity',
+          code: err.code,
+          message: err.message,
+          details: err.details,
+        });
+      }
+      throw err;
+    }
+    return reply.code(result.status === 'clean' ? 200 : 409).send(result);
   });
 
   app.get('/api/v1/merges', async () => ({

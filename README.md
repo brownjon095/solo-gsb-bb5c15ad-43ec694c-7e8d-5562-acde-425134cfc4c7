@@ -4,7 +4,9 @@
 A、B 两组 RFC 6902 补丁（仅支持 `add` / `remove` / `replace`），服务在**基准坐标系**下合并两组
 补丁：以基准数组索引标识原元素、同一插入缝隙按 **A 后 B** 定序、自动重定位增删引起的索引漂移，
 产出**确定的合并结果**；当两组补丁在同一元素/对象路径上发生「删除 vs 修改」或「不同值替换」等
-冲突时，返回**结构化冲突**（含双方操作序号、规范化路径、原因）。
+冲突时，返回**结构化冲突**（含双方操作序号、规范化路径、原因）。此外提供**变基预演**：
+提交原始 `base`、基于 `base` 的 `patch` 与目标版本 `onto`，服务把待发布变更移到新版本，
+返回合并结果与相对 `onto` 的可执行补丁（服务端重放校验）。
 
 技术栈：Node.js 20+ · Fastify 5 · 纯内存存储（无外部依赖服务）。
 
@@ -34,6 +36,7 @@ npm ci && npm start
 | 端口 | `3000` |
 | 健康检查 | `http://localhost:3000/health` |
 | 合并接口 | `POST http://localhost:3000/api/v1/merges` |
+| 变基接口 | `POST http://localhost:3000/api/v1/rebases` |
 
 ## 配置项（环境变量）
 
@@ -52,6 +55,7 @@ npm ci && npm start
 | `GET` | `/` | 服务元信息与端点清单 |
 | `GET` | `/api/v1/example` | 返回示例请求体（干净合并 + 冲突各一份） |
 | `POST` | `/api/v1/merges` | 执行合并预演，结果落内存存储 |
+| `POST` | `/api/v1/rebases` | 把基于 `base` 的 `patch` 变基到目标版本 `onto`：干净时返回 `merged` 与相对 `onto` 的 `rebasedPatch`（服务端重放校验），冲突时返回结构化冲突（不落存储） |
 | `GET` | `/api/v1/merges` | 列出全部预演记录（摘要） |
 | `GET` | `/api/v1/merges/:id` | 查询单条预演（含输入与结果） |
 | `GET` | `/api/v1/merges/:id/order-audit` | 对已保存输入按严格 RFC 6902 顺序重放 A→B 与 B→A，判定可交换性 |
@@ -86,6 +90,102 @@ npm ci && npm start
 - **请求体结构/操作类型不合法 → `400`**
 
 无论 `200` 还是 `409`，记录都会存入内存存储，可凭 `id` 查询。
+
+### `POST /api/v1/rebases`（变基预演）
+
+客户端基于旧版本 `base` 准备了一组待发布变更 `patch`，而平台版本已前进到 `onto`。
+本接口帮助客户端把变更**移到新版本**：先把 `base → onto` 的差异转换为合并引擎的
+**基准坐标操作**（见下），再与客户端 `patch` 做三方合并。
+
+请求体（也见 `examples/rebase-request.json`，或 `GET /api/v1/example`）：
+
+```json
+{
+  "base":  { "任意": "原始版本 JSON 文档" },
+  "patch": [ { "op": "replace", "path": "/replicas", "value": 3 } ],
+  "onto":  { "任意": "目标版本 JSON 文档" }
+}
+```
+
+- `base` / `onto`：任意 JSON 文档（对象、数组、标量均可）。
+- `patch`：针对 `base` 的 RFC 6902 操作数组，**仅接受 `add` / `remove` / `replace`**。
+- 与 `POST /api/v1/merges` 不同，本接口是**无状态预演**：结果不落存储，响应不含 `id`。
+
+`base → onto` 的转换规则（`src/rebase.js`）：
+
+- **对象**：键按字典序处理；仅存在于 `onto` 的成员发 `add`、仅存在于 `base` 的发
+  `remove`、值变化的标量发 `replace`，共有容器递归比较。
+- **数组**：按**深度相等**元素的最长公共子序列（LCS）对齐——匹配元素**保留基准身份**；
+  未匹配的基准元素按**基准下标**发 `remove`；未匹配的目标元素发 `add`，地址为
+  **下一个保留基准元素之前的缝隙**（其后没有保留元素时为追加缝隙）。同一对保留元素
+  之间的**连续插入共享同一缝隙**，由合并引擎按目标顺序累积落位。
+- 容器类型变化（数组↔对象、容器↔标量）在该路径整体 `replace`。
+
+生成的 onto 操作（侧名 `onto`）与客户端 `patch`（侧名 `patch`）按基准坐标模型合并：
+同一缝隙的插入 **onto 在前、patch 在后**（如同 git rebase 把待发布提交重放到新版本
+之上）；与 onto 中已相同的客户端写入被去重（计入 `deduplicated`，不再出现在
+`rebasedPatch` 中）。
+
+响应：
+
+- **合并干净 → `200`**：`{ status: "clean", merged, rebasedPatch, conflicts: [], stats }`
+  - `merged`：三方合并结果（客户端变更已重定位到 `onto` 之上）。
+  - `rebasedPatch`：相对 **`onto`** 的确定性 RFC 6902 补丁——对 `onto` 逐条执行即得到
+    `merged`。服务端返回前会**实际重放校验**（`onto + rebasedPatch` 必须等于 `merged`），
+    校验失败按 `500` 处理（正常输入下不会发生）。
+- **存在冲突 → `409`**：`{ status: "conflict", merged: null, rebasedPatch: null, conflicts: [...], stats }`
+  ——**不返回可执行补丁**。每条冲突含 `reason`（同合并接口的四种）、规范化 `path`、
+  `operations`（双方操作的 `side`、`index`、`op`、`path`、`value`：`side: "onto"` 为服务端
+  生成的 base→onto 操作，`side: "patch"` 为客户端提交的操作，`index` 为各自操作序号）
+  与 `message`。
+- **补丁不合法（路径不存在、越界、缺 `value` 等）→ `422`**：
+  `{ statusCode, error, code: "INVALID_PATCH", message, details: { side, index } }`，
+  其中 `details.side` 为 `"patch"`（客户端补丁问题）或 `"onto"`。
+- **请求体结构/操作类型不合法 → `400`**。
+
+`stats`：`received` / `normalized` 按 `onto` / `patch` 两侧分别计数；
+`deduplicated`、`conflicts`、`applied` 含义同合并接口；`rebased` 为 `rebasedPatch`
+的操作数（冲突时为 `0`）。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/rebases \
+  -H 'Content-Type: application/json' \
+  -d @examples/rebase-request.json | jq
+```
+
+该示例中：`onto` 相对 `base` 追加了一台服务器（`c.internal`）、新增 `features.retries`
+与 `version`；客户端 `patch` 把 `replicas` 改为 `3`、在 `servers` 索引 1 处插入一台
+canary、开启 `tracing`。响应：
+
+```json
+{
+  "status": "clean",
+  "merged": {
+    "app": "payment-service",
+    "replicas": 3,
+    "servers": [
+      { "host": "a.internal", "port": 8080 },
+      { "host": "canary.internal", "port": 8080 },
+      { "host": "b.internal", "port": 8080 },
+      { "host": "c.internal", "port": 8080 }
+    ],
+    "features": { "cache": true, "tracing": true, "retries": 3 },
+    "version": "2.0.0"
+  },
+  "rebasedPatch": [
+    { "op": "replace", "path": "/features/tracing", "value": true },
+    { "op": "replace", "path": "/replicas", "value": 3 },
+    { "op": "add", "path": "/servers/1", "value": { "host": "canary.internal", "port": 8080 } }
+  ],
+  "stats": { "received": { "onto": 3, "patch": 3 }, "normalized": { "onto": 3, "patch": 3 },
+             "deduplicated": 0, "conflicts": 0, "applied": 6, "rebased": 3 }
+}
+```
+
+可以看到：客户端在基准缝隙 1 的插入被重定位到 `onto` 文档的最终下标 1（`onto` 追加的
+`c.internal` 保持在其后）；`rebasedPatch` 可直接对 `onto` 执行得到 `merged`。
 
 ### `GET /api/v1/merges/:id/order-audit`（顺序审计）
 
@@ -463,6 +563,9 @@ curl -s -X POST http://localhost:3000/api/v1/merges \
 
 ```bash
 curl -s http://localhost:3000/health | jq                 # 健康检查
+curl -s -X POST http://localhost:3000/api/v1/rebases \
+  -H 'Content-Type: application/json' \
+  -d @examples/rebase-request.json | jq                   # 变基预演（base + patch → onto）
 curl -s http://localhost:3000/api/v1/merges | jq          # 预演记录列表
 curl -s http://localhost:3000/api/v1/merges/<id> | jq     # 单条记录（含输入）
 curl -s http://localhost:3000/api/v1/merges/<id>/order-audit | jq  # 顺序审计 A→B / B→A
@@ -535,7 +638,12 @@ npm test
 前向与回滚重放校验、操作数统计、干净记录可用 / 冲突记录 `409` 且不改记录 / 未知 `404`
 与重复请求逐字节一致，以及叶子来源追踪的 base / A / B / both 归属（相同值双边写入）、
 后写覆盖与删除后重建的幸存操作归属、数组删除重定位与同缝隙 A/B 定序下的最终指针、
-空容器叶子、根替换、路径排序与重复请求逐字节一致等。
+空容器叶子、根替换、路径排序与重复请求逐字节一致等；以及变基预演的 base→onto
+基准坐标转换（数组 LCS 保留元素身份、未匹配元素删除/插入、连续插入共享缝隙、
+转换结果经合并引擎重放等于 onto）、空补丁与已上游化变更的去重、同缝隙 onto 先 /
+patch 后定序、干净变基的 merged 与 rebasedPatch（重放等于 merged）、冲突的
+onto/patch 双方序号与不返回可执行补丁、非法补丁 `422`（side 为 patch）、
+schema 校验 `400` 与重复请求确定性。
 
 ## 项目结构
 
@@ -548,6 +656,7 @@ npm test
 │   ├── audit.js               # 顺序审计：严格 RFC 6902 顺序重放 A→B / B→A、失败捕获、字典序最小差异
 │   ├── resolution.js          # 冲突解决预览：胜方决定校验 → 剔除败方 → 复用合并引擎（纯函数，不写存储）
 │   ├── roundtrip.js           # 往返补丁：字典序对象 diff + 数组 LCS（删除降序/插入升序）→ RFC 6902 forward/rollback，服务端重放校验
+│   ├── rebase.js              # 变基预演：base→onto 转基准坐标操作（数组 LCS 对齐、连续插入同缝隙）→ 三方合并 → 相对 onto 的 rebasedPatch（重放校验）
 │   ├── provenance.js          # 叶子来源追踪：在带来源标签的镜像文档上重放基准坐标合并，归属 merged 每个叶子（base/A/B/both）
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
@@ -571,3 +680,7 @@ npm test
   基准坐标合并管线，把 `merged` 每个叶子归属到 `base` / `A` / `B` / `both` 并列出贡献
   操作的原始序号；路径为最终 JSON Pointer，按 UTF-16 码元序排序，结果按记录缓存，
   重复请求逐字节一致；仅干净合并记录可用，冲突记录返回 `409`。
+- 变基预演（`POST /api/v1/rebases`）是无状态的：结果不落存储、响应不含 `id`；
+  `base → onto` 的差异先转换为基准坐标操作（数组按深度相等 LCS 对齐、未匹配元素
+  删除/插入、连续插入共享缝隙），再与客户端 `patch` 三方合并；干净时返回的
+  `rebasedPatch` 相对 `onto`，服务端重放校验通过后才返回，冲突时不返回可执行补丁。
